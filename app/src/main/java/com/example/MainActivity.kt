@@ -49,6 +49,7 @@ import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.SketchDarkBackground
 import com.example.ui.theme.SketchDarkSurface
 import com.example.ui.theme.SketchOrange
+import com.example.ui.theme.SketchOrangeLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.util.ExportHelper
@@ -83,8 +84,12 @@ fun LineSketchApp(viewModel: MainViewModel = viewModel()) {
     val canvasState by viewModel.canvasState.collectAsStateWithLifecycle()
     val currentMode by viewModel.currentMode.collectAsStateWithLifecycle()
     val evaluationResult by viewModel.evaluationResult.collectAsStateWithLifecycle()
+
+    val previewBitmap by viewModel.previewBitmap.collectAsStateWithLifecycle()
     val isAnalyzing by viewModel.isAnalyzing.collectAsStateWithLifecycle()
-    val analysisMessage by viewModel.analysisMessage.collectAsStateWithLifecycle()
+    val analysisStage by viewModel.analysisStage.collectAsStateWithLifecycle()
+    val analysisError by viewModel.analysisError.collectAsStateWithLifecycle()
+
     val showSettingsDialog by viewModel.showSettingsDialog.collectAsStateWithLifecycle()
     val showLayersDialog by viewModel.showLayersDialog.collectAsStateWithLifecycle()
     val showApiKeyPrompt by viewModel.showApiKeyPrompt.collectAsStateWithLifecycle()
@@ -112,8 +117,15 @@ fun LineSketchApp(viewModel: MainViewModel = viewModel()) {
                     HomeScreen(
                         recentProjects = recentProjects,
                         detailLevel = viewModel.detailLevel,
+                        previewBitmap = previewBitmap,
+                        isAnalyzing = isAnalyzing,
+                        analysisStage = analysisStage,
+                        analysisError = analysisError,
                         onSelectGalleryImage = { uri -> viewModel.onImageSelectedFromGallery(uri) },
                         onCameraCapture = { bmp -> viewModel.onImageCapturedFromCamera(bmp) },
+                        onStartAnalysis = { viewModel.startImageAnalysis() },
+                        onDismissPreview = { viewModel.dismissPreview() },
+                        onUseOfflineTutorial = { viewModel.useOfflineTutorialForCurrentPreview() },
                         onSelectTutorial = { tut -> viewModel.loadBuiltinTutorial(tut) },
                         onResumeProject = { proj -> viewModel.resumeProject(proj) },
                         onDeleteProject = { proj -> viewModel.deleteProject(proj) },
@@ -200,7 +212,7 @@ fun LineSketchApp(viewModel: MainViewModel = viewModel()) {
                 }
             }
 
-            // AI Loading / Analysis Overlay
+            // Global Fullscreen Loading Overlay (when analyzing)
             AnimatedVisibility(
                 visible = isAnalyzing,
                 enter = fadeIn(),
@@ -232,16 +244,16 @@ fun LineSketchApp(viewModel: MainViewModel = viewModel()) {
                             )
                             Spacer(modifier = Modifier.height(18.dp))
                             Text(
-                                text = "AI Vision Analyzing Sketch",
+                                text = "Analyzing Image...",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = TextPrimary
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = analysisMessage,
+                                text = analysisStage,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary,
+                                color = SketchOrangeLight,
                                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                                 lineHeight = 18.sp
                             )

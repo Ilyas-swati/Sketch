@@ -2,8 +2,8 @@ package com.example.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
@@ -20,9 +20,9 @@ import com.example.model.EvaluationResult
 import com.example.model.NormalizedPoint
 import com.example.model.UserStroke
 import com.example.ui.canvas.CanvasState
-import com.example.ui.theme.GuideOrange
-import com.example.ui.theme.PencilGraphite
+import com.example.util.ImageLoader
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -31,7 +31,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.InputStream
 import java.util.UUID
 
 enum class AppScreen {
@@ -43,6 +42,7 @@ enum class AppScreen {
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val TAG = "LineSketchAI"
     private val db = SketchDatabase.getInstance(application)
     private val dao = db.sketchDao()
     private val prefs = PreferencesManager(application)
@@ -54,6 +54,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Recent Projects from Room
     private val _recentProjects = MutableStateFlow<List<SketchProjectEntity>>(emptyList())
     val recentProjects: StateFlow<List<SketchProjectEntity>> = _recentProjects.asStateFlow()
+
+    // Staged Image Preview (Upload Image -> Image Preview -> Press Analyze)
+    private val _previewBitmap = MutableStateFlow<Bitmap?>(null)
+    val previewBitmap: StateFlow<Bitmap?> = _previewBitmap.asStateFlow()
+
+    private val _previewTitle = MutableStateFlow("Custom Reference Sketch")
+    val previewTitle: StateFlow<String> = _previewTitle.asStateFlow()
+
+    private val _previewUri = MutableStateFlow<String?>(null)
+    val previewUri: StateFlow<String?> = _previewUri.asStateFlow()
+
+    // Analysis Stage & Error handling
+    private val _isAnalyzing = MutableStateFlow(false)
+    val isAnalyzing: StateFlow<Boolean> = _isAnalyzing.asStateFlow()
+
+    private val _analysisStage = MutableStateFlow("Preparing image...")
+    val analysisStage: StateFlow<String> = _analysisStage.asStateFlow()
+
+    private val _analysisError = MutableStateFlow<String?>(null)
+    val analysisError: StateFlow<String?> = _analysisError.asStateFlow()
+
+    private var activeAnalysisJob: Job? = null
 
     // Current Project & Canvas Session
     private val _currentProjectId = MutableStateFlow(UUID.randomUUID().toString())
@@ -87,13 +109,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // AI Evaluation
     private val _evaluationResult = MutableStateFlow<EvaluationResult?>(null)
     val evaluationResult: StateFlow<EvaluationResult?> = _evaluationResult.asStateFlow()
-
-    // AI Analysis State
-    private val _isAnalyzing = MutableStateFlow(false)
-    val isAnalyzing: StateFlow<Boolean> = _isAnalyzing.asStateFlow()
-
-    private val _analysisMessage = MutableStateFlow("")
-    val analysisMessage: StateFlow<String> = _analysisMessage.asStateFlow()
 
     // Dialog Toggles
     private val _showSettingsDialog = MutableStateFlow(false)
@@ -138,7 +153,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _currentMode.value = mode
         when (mode) {
             DrawingMode.CHALLENGE -> {
-                // In challenge mode, guide is hidden until user asks or finishes
                 _canvasState.value = _canvasState.value.copy(showGuide = false, showReference = false)
             }
             DrawingMode.TRACE -> {
@@ -153,76 +167,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Media Input & AI Analysis ---
+    // --- Media Input Stage 1: Safe Decode into Preview ---
 
     fun onImageSelectedFromGallery(uri: Uri) {
         viewModelScope.launch {
-            try {
-                val context = getApplication<Application>()
-                val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
-                val bitmap = BitmapFactory.decodeStream(inputStream)
-                inputStream?.close()
+            _analysisError.value = null
+            _isAnalyzing.value = false
 
-                if (bitmap != null) {
-                    processUploadedImage(bitmap, "Sketch from Gallery", uri.toString())
-                } else {
-                    _errorMessage.value = "Unable to load the selected image."
-                }
-            } catch (e: Exception) {
-                _errorMessage.value = "Error reading image: ${e.message}"
+            val context = getApplication<Application>()
+            val decodeResult = ImageLoader.decodeSampledBitmapFromUri(context, uri, 1024)
+
+            decodeResult.onSuccess { sampledBmp ->
+                _previewBitmap.value = sampledBmp
+                _previewTitle.value = "Photo Sketch"
+                _previewUri.value = uri.toString()
+                Log.d(TAG, "PREVIEW_STAGED: Image ready for user preview and confirmation")
+            }.onFailure { err ->
+                Log.e(TAG, "PREVIEW_STAGE_ERROR: ${err.message}", err)
+                _errorMessage.value = err.message ?: "Unable to read this image. Please choose another image."
             }
         }
     }
 
     fun onImageCapturedFromCamera(bitmap: Bitmap) {
-        processUploadedImage(bitmap, "Camera Capture", null)
+        _analysisError.value = null
+        _isAnalyzing.value = false
+
+        val safeBmp = ImageLoader.scaleBitmapWithinBounds(bitmap, 1024)
+        _previewBitmap.value = safeBmp
+        _previewTitle.value = "Camera Sketch"
+        _previewUri.value = null
+        Log.d(TAG, "PREVIEW_STAGED: Camera photo ready for user preview and confirmation")
     }
 
-    private fun processUploadedImage(bitmap: Bitmap, defaultTitle: String, imageUri: String?) {
-        viewModelScope.launch {
-            _isAnalyzing.value = true
-            _analysisMessage.value = "AI is inspecting subject, anatomy, guidelines & shapes..."
+    fun dismissPreview() {
+        if (_isAnalyzing.value) {
+            activeAnalysisJob?.cancel()
+            _isAnalyzing.value = false
+        }
+        _previewBitmap.value = null
+        _previewUri.value = null
+        _analysisError.value = null
+    }
 
-            val activeApiKey = apiKey
-            val currentLevel = prefs.detailLevel
+    // --- Media Input Stage 2: Press Analyze Image ---
 
-            if (activeApiKey.isBlank()) {
-                // Prompt user for key or use intelligent offline plan
-                _analysisMessage.value = "No API key found. Generating progressive offline construction plan..."
-                val offlineResult = AIAnalyzer.generateOfflineAdaptivePlan(defaultTitle, currentLevel)
-                setupNewProject(
-                    title = offlineResult.title,
-                    steps = offlineResult.steps,
-                    bitmap = bitmap,
-                    imageUri = imageUri
-                )
-                _isAnalyzing.value = false
-                _showApiKeyPrompt.value = true
+    fun startImageAnalysis() {
+        val bmp = _previewBitmap.value
+        if (bmp == null || bmp.isRecycled) {
+            _errorMessage.value = "No image selected. Please choose an image first."
+            return
+        }
+
+        if (_isAnalyzing.value) {
+            Log.w(TAG, "Analysis request already in progress. Ignoring duplicate trigger.")
+            return
+        }
+
+        activeAnalysisJob?.cancel()
+        activeAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) {
+                _isAnalyzing.value = true
+                _analysisError.value = null
+                _analysisStage.value = "Preparing image..."
+            }
+
+            val currentKey = apiKey
+            if (currentKey.isBlank()) {
+                withContext(Dispatchers.Main) {
+                    _isAnalyzing.value = false
+                    _analysisError.value = "Please add your AI API key in Settings first."
+                    _showApiKeyPrompt.value = true
+                }
                 return@launch
             }
 
-            val analysisResult = AIAnalyzer.analyzeImage(bitmap, currentLevel, activeApiKey)
-            analysisResult.onSuccess { result ->
-                setupNewProject(
-                    title = result.title,
-                    steps = result.steps,
-                    bitmap = bitmap,
-                    imageUri = imageUri
-                )
-            }.onFailure { err ->
-                // Fallback gracefully so user can always draw!
-                _errorMessage.value = "AI analysis issue: ${err.message}. Loaded offline tutorial structure."
-                val fallback = AIAnalyzer.generateOfflineAdaptivePlan(defaultTitle, currentLevel)
-                setupNewProject(
-                    title = fallback.title,
-                    steps = fallback.steps,
-                    bitmap = bitmap,
-                    imageUri = imageUri
-                )
-            }
+            val currentLevel = prefs.detailLevel
+            val result = AIAnalyzer.analyzeImage(
+                bitmap = bmp,
+                detailLevel = currentLevel,
+                apiKey = currentKey,
+                onProgress = { stageMsg ->
+                    viewModelScope.launch(Dispatchers.Main) {
+                        _analysisStage.value = stageMsg
+                    }
+                }
+            )
 
-            _isAnalyzing.value = false
+            withContext(Dispatchers.Main) {
+                result.onSuccess { tutorial ->
+                    Log.d(TAG, "ANALYSIS_SUCCESS: Setting up canvas with ${tutorial.steps.size} steps")
+                    _isAnalyzing.value = false
+                    _analysisError.value = null
+
+                    setupNewProject(
+                        title = tutorial.title,
+                        steps = tutorial.steps,
+                        bitmap = bmp,
+                        imageUri = _previewUri.value
+                    )
+                    // Clear preview state since project is now active
+                    _previewBitmap.value = null
+                    _previewUri.value = null
+                }.onFailure { err ->
+                    Log.e(TAG, "ANALYSIS_FAILED: ${err.message}", err)
+                    _isAnalyzing.value = false
+                    _analysisError.value = err.message ?: "Analysis failed. Please try again."
+                }
+            }
         }
+    }
+
+    fun useOfflineTutorialForCurrentPreview() {
+        val bmp = _previewBitmap.value
+        val offlinePlan = AIAnalyzer.generateOfflineAdaptivePlan(_previewTitle.value, prefs.detailLevel)
+        _isAnalyzing.value = false
+        _analysisError.value = null
+
+        setupNewProject(
+            title = offlinePlan.title,
+            steps = offlinePlan.steps,
+            bitmap = bmp,
+            imageUri = _previewUri.value
+        )
+        _previewBitmap.value = null
+        _previewUri.value = null
     }
 
     fun loadBuiltinTutorial(tutorial: TutorialProvider.TutorialTemplate) {
@@ -394,7 +463,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun tryAgainCurrentStep() {
-        // Erase strokes drawn during the current step so user can re-trace
         val currentIndex = _currentStepIndex.value
         val filtered = _canvasState.value.strokes.filter { it.stepIndex != currentIndex }
         _canvasState.value = _canvasState.value.copy(strokes = filtered)
@@ -409,7 +477,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _currentStepIndex.value = nextIdx
             autoSaveProject()
         } else {
-            // Completed all steps!
             autoSaveProject()
             _currentScreen.value = AppScreen.COMPLETION
         }
@@ -577,7 +644,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         } catch (e: Exception) {
-            // fallback
+            Log.e(TAG, "Error deserializing steps: ${e.message}")
         }
         return list
     }
@@ -631,7 +698,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         } catch (e: Exception) {
-            // fallback
+            Log.e(TAG, "Error deserializing strokes: ${e.message}")
         }
         return list
     }

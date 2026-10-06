@@ -4,12 +4,16 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -34,17 +38,21 @@ import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Pets
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -60,7 +68,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -73,7 +82,6 @@ import com.example.ui.theme.SketchDarkSurface
 import com.example.ui.theme.SketchDarkSurfaceBorder
 import com.example.ui.theme.SketchDarkSurfaceElevated
 import com.example.ui.theme.SketchOrange
-import com.example.ui.theme.SketchOrangeGlow
 import com.example.ui.theme.SketchOrangeLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
@@ -83,8 +91,15 @@ import com.example.ui.theme.TextTertiary
 fun HomeScreen(
     recentProjects: List<SketchProjectEntity>,
     detailLevel: DetailLevel,
+    previewBitmap: Bitmap?,
+    isAnalyzing: Boolean,
+    analysisStage: String,
+    analysisError: String?,
     onSelectGalleryImage: (Uri) -> Unit,
     onCameraCapture: (Bitmap) -> Unit,
+    onStartAnalysis: () -> Unit,
+    onDismissPreview: () -> Unit,
+    onUseOfflineTutorial: () -> Unit,
     onSelectTutorial: (TutorialProvider.TutorialTemplate) -> Unit,
     onResumeProject: (SketchProjectEntity) -> Unit,
     onDeleteProject: (SketchProjectEntity) -> Unit,
@@ -178,121 +193,338 @@ fun HomeScreen(
             }
         }
 
-        // Center Artistic Sketch Orb Hero Card
-        item {
-            Card(
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = SketchDarkSurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, SketchDarkSurfaceBorder),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .shadow(12.dp, RoundedCornerShape(24.dp))
-            ) {
-                Column(
+        // STAGE 2: Image Preview Card (Shown when an image is staged)
+        if (previewBitmap != null && !previewBitmap.isRecycled) {
+            item {
+                Card(
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = SketchDarkSurface),
+                    border = androidx.compose.foundation.BorderStroke(1.5.dp, SketchOrange),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                        .shadow(16.dp, RoundedCornerShape(20.dp))
                 ) {
-                    // Artistic Glowing Sketch Orb
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier.size(130.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        // Outer pulsating glow
-                        Canvas(modifier = Modifier.size(130.dp * glowScale)) {
-                            drawCircle(
-                                brush = Brush.radialGradient(
-                                    colors = listOf(SketchOrange.copy(alpha = 0.45f), Color.Transparent),
-                                    center = center,
-                                    radius = size.width / 2f
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = SketchOrange, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Image Preview & Analysis",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary
                                 )
+                            }
+                            if (!isAnalyzing) {
+                                IconButton(
+                                    onClick = onDismissPreview,
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(Icons.Default.Close, contentDescription = "Cancel", tint = TextSecondary)
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Resized Image Preview Box
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(220.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF10111A)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(
+                                bitmap = previewBitmap.asImageBitmap(),
+                                contentDescription = "Reference Preview",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize()
+                            )
+
+                            // Loading Overlay over image preview if currently analyzing
+                            if (isAnalyzing) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(Color.Black.copy(alpha = 0.70f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.Center,
+                                        modifier = Modifier.padding(16.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            color = SketchOrange,
+                                            strokeWidth = 3.dp,
+                                            modifier = Modifier.size(44.dp)
+                                        )
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                        Text(
+                                            text = "Analyzing Image...",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = TextPrimary
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = analysisStage,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = SketchOrangeLight,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Detail Level Chip Display
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Detail Mode: ${detailLevel.displayName} (${detailLevel.targetSteps})",
+                                fontSize = 12.sp,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = "${previewBitmap.width}x${previewBitmap.height} px",
+                                fontSize = 11.sp,
+                                color = TextTertiary
                             )
                         }
 
-                        // Core orb sphere
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(90.dp)
-                                .clip(CircleShape)
-                                .background(
-                                    Brush.linearGradient(
-                                        listOf(Color(0xFF281812), Color(0xFF1B1B2A))
+                        // Error Banner if analysis failed
+                        if (!analysisError.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = Color(0xFF2A1515),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF5252)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        Icons.Default.ErrorOutline,
+                                        contentDescription = "Error",
+                                        tint = Color(0xFFFF5252),
+                                        modifier = Modifier.size(20.dp)
                                     )
-                                )
-                                .border(2.dp, SketchOrange, CircleShape)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = analysisError,
+                                        color = Color(0xFFFF8A80),
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        // Action Buttons: Analyze / Try Again / Offline
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(
-                                Icons.Default.AutoAwesome,
-                                contentDescription = "AI Tutor",
-                                tint = SketchOrangeLight,
-                                modifier = Modifier.size(46.dp)
-                            )
+                            if (!analysisError.isNullOrBlank()) {
+                                // Try Again Button
+                                Button(
+                                    onClick = onStartAnalysis,
+                                    enabled = !isAnalyzing,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = SketchOrange,
+                                        contentColor = Color.Black
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp)
+                                        .testTag("retry_analysis_button")
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Try Again", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                }
+
+                                // Use Offline Tutorial Button
+                                OutlinedButton(
+                                    onClick = onUseOfflineTutorial,
+                                    enabled = !isAnalyzing,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(44.dp)
+                                        .testTag("offline_fallback_button")
+                                ) {
+                                    Text("Use Offline Construction Plan", fontSize = 12.sp)
+                                }
+                            } else {
+                                // Primary Analyze Image Button
+                                Button(
+                                    onClick = onStartAnalysis,
+                                    enabled = !isAnalyzing,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = SketchOrange,
+                                        contentColor = Color.Black
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp)
+                                        .testTag("analyze_image_button")
+                                ) {
+                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (isAnalyzing) "Analyzing..." else "Analyze Image",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                            }
                         }
                     }
+                }
+            }
+        }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Text(
-                        text = "Your Personal Drawing Tutor",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = TextPrimary
-                    )
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    Text(
-                        text = "Upload any photo. The AI breaks it down into progressive, beginner-friendly strokes so you can master sketching one line at a time.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary,
-                        lineHeight = 18.sp,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                    )
-
-                    Spacer(modifier = Modifier.height(18.dp))
-
-                    // Main Action Buttons: Gallery & Camera
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        // Center Artistic Sketch Orb Hero Card (Only shown if no preview active)
+        if (previewBitmap == null) {
+            item {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = SketchDarkSurface),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, SketchDarkSurfaceBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(12.dp, RoundedCornerShape(24.dp))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Button(
-                            onClick = {
-                                galleryLauncher.launch(
-                                    androidx.activity.result.PickVisualMediaRequest(
-                                        ActivityResultContracts.PickVisualMedia.ImageOnly
+                        // Artistic Glowing Sketch Orb
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.size(130.dp)
+                        ) {
+                            Canvas(modifier = Modifier.size(130.dp * glowScale)) {
+                                drawCircle(
+                                    brush = Brush.radialGradient(
+                                        colors = listOf(SketchOrange.copy(alpha = 0.45f), Color.Transparent),
+                                        center = center,
+                                        radius = size.width / 2f
                                     )
                                 )
-                            },
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = SketchOrange,
-                                contentColor = Color.Black
-                            ),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(50.dp)
-                                .testTag("upload_image_button")
-                        ) {
-                            Icon(Icons.Default.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(20.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Upload Photo", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(90.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        Brush.linearGradient(
+                                            listOf(Color(0xFF281812), Color(0xFF1B1B2A))
+                                        )
+                                    )
+                                    .border(2.dp, SketchOrange, CircleShape)
+                            ) {
+                                Icon(
+                                    Icons.Default.AutoAwesome,
+                                    contentDescription = "AI Tutor",
+                                    tint = SketchOrangeLight,
+                                    modifier = Modifier.size(46.dp)
+                                )
+                            }
                         }
 
-                        OutlinedButton(
-                            onClick = { cameraLauncher.launch(null) },
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(50.dp)
-                                .testTag("camera_photo_button")
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Text(
+                            text = "Your Personal Drawing Tutor",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        Text(
+                            text = "Upload any photo. The AI breaks it down into progressive, beginner-friendly strokes so you can master sketching one line at a time.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            lineHeight = 18.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+
+                        Spacer(modifier = Modifier.height(18.dp))
+
+                        // Main Action Buttons: Gallery & Camera
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(20.dp), tint = SketchOrange)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Take Photo", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Button(
+                                onClick = {
+                                    galleryLauncher.launch(
+                                        androidx.activity.result.PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly
+                                        )
+                                    )
+                                },
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = SketchOrange,
+                                    contentColor = Color.Black
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(50.dp)
+                                    .testTag("upload_image_button")
+                            ) {
+                                Icon(Icons.Default.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Upload Photo", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+
+                            OutlinedButton(
+                                onClick = { cameraLauncher.launch(null) },
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(50.dp)
+                                    .testTag("camera_photo_button")
+                            ) {
+                                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(20.dp), tint = SketchOrange)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Take Photo", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            }
                         }
                     }
                 }

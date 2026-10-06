@@ -2,10 +2,12 @@ package com.example.ai
 
 import android.graphics.Bitmap
 import android.util.Base64
+import android.util.Log
 import com.example.data.TutorialProvider
 import com.example.model.DetailLevel
 import com.example.model.DrawingStep
 import com.example.model.NormalizedPoint
+import com.example.util.ImageLoader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -13,53 +15,63 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
-import kotlin.math.cos
-import kotlin.math.sin
 
 object AIAnalyzer {
 
+    private const val TAG = "LineSketchAI"
+
+    // OkHttpClient with 30s connect and 75s read/write timeouts
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(75, TimeUnit.SECONDS)
+            .writeTimeout(75, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
     }
 
-    private fun Bitmap.toBase64Jpg(maxDimension: Int = 1024): String {
-        val scale = if (width > maxDimension || height > maxDimension) {
-            maxDimension.toFloat() / kotlin.math.max(width, height)
-        } else {
-            1.0f
-        }
-        val targetWidth = (width * scale).toInt().coerceAtLeast(1)
-        val targetHeight = (height * scale).toInt().coerceAtLeast(1)
-        val scaled = Bitmap.createScaledBitmap(this, targetWidth, targetHeight, true)
-
-        val outputStream = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 85, outputStream)
-        return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
-    }
+    data class AnalysisResult(
+        val title: String,
+        val detectedSubject: String,
+        val steps: List<DrawingStep>
+    )
 
     /**
-     * Sends the image to Gemini vision model to generate a progressive vector sketch tutorial.
+     * Executes safe, memory-conscious progressive sketch analysis with multi-stage progress reporting.
      */
     suspend fun analyzeImage(
         bitmap: Bitmap,
         detailLevel: DetailLevel,
-        apiKey: String
+        apiKey: String,
+        onProgress: (String) -> Unit = {}
     ): Result<AnalysisResult> = withContext(Dispatchers.IO) {
+        Log.d(TAG, "ANALYSIS_START")
+
         if (apiKey.isBlank()) {
-            return@withContext Result.failure(
-                IllegalArgumentException("No Gemini API key configured. Please enter your API key in Settings or try our built-in offline tutorials!")
-            )
+            val err = "Please add your AI API key in Settings first."
+            Log.e(TAG, "ANALYSIS_ERROR: $err")
+            return@withContext Result.failure(IllegalArgumentException(err))
         }
 
         try {
-            val base64Data = bitmap.toBase64Jpg()
+            // Stage 1: Preparing image
+            onProgress("Preparing image...")
+            Log.d(TAG, "BITMAP_DECODE_START: Scaling bitmap to safe dimension")
+            val safeBitmap = ImageLoader.scaleBitmapWithinBounds(bitmap, 1024)
+            Log.d(TAG, "BITMAP_DECODE_SUCCESS: Dimensions = ${safeBitmap.width}x${safeBitmap.height}")
+
+            val jpegBytes = ImageLoader.compressToJpeg(safeBitmap, 85)
+            val base64Data = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+            Log.d(TAG, "IMAGE_COMPRESSED: Base64 string length = ${base64Data.length}")
+
+            // Stage 2: Sending image to AI
+            onProgress("Sending image to AI...")
             val promptText = buildInstructionPrompt(detailLevel)
 
             val requestJson = JSONObject().apply {
@@ -67,12 +79,10 @@ object AIAnalyzer {
                 val contentObj = JSONObject().apply {
                     val partsArray = JSONArray()
 
-                    // Text prompt part
                     partsArray.put(JSONObject().apply {
                         put("text", promptText)
                     })
 
-                    // Image inline data part
                     partsArray.put(JSONObject().apply {
                         put("inlineData", JSONObject().apply {
                             put("mimeType", "image/jpeg")
@@ -99,74 +109,140 @@ object AIAnalyzer {
                 .post(requestBody)
                 .build()
 
-            val response = httpClient.newCall(request).execute()
+            // Stage 3: AI analyzing drawing
+            onProgress("AI is analyzing the drawing...")
+            Log.d(TAG, "API_REQUEST_START: Calling Gemini Vision endpoint (gemini-3.5-flash)")
+
+            val response = try {
+                httpClient.newCall(request).execute()
+            } catch (e: SocketTimeoutException) {
+                Log.e(TAG, "ANALYSIS_ERROR: SocketTimeoutException", e)
+                return@withContext Result.failure(Exception("Analysis timed out. Please try again."))
+            } catch (e: UnknownHostException) {
+                Log.e(TAG, "ANALYSIS_ERROR: UnknownHostException", e)
+                return@withContext Result.failure(Exception("Network connection failed. Check your internet connection."))
+            } catch (e: IOException) {
+                Log.e(TAG, "ANALYSIS_ERROR: IOException calling API", e)
+                return@withContext Result.failure(Exception("Network error: ${e.localizedMessage ?: "Connection failure"}"))
+            }
+
+            val responseCode = response.code
             val responseString = response.body?.string() ?: ""
+            Log.d(TAG, "API_RESPONSE_RECEIVED: HTTP $responseCode, length = ${responseString.length}")
 
             if (!response.isSuccessful) {
-                val errorMsg = try {
-                    val errJson = JSONObject(responseString)
-                    errJson.optJSONObject("error")?.optString("message") ?: "HTTP error: ${response.code}"
-                } catch (e: Exception) {
-                    "HTTP ${response.code}: $responseString"
-                }
-                return@withContext Result.failure(Exception("Gemini API Error: $errorMsg"))
+                val errorMsg = extractErrorMessage(responseCode, responseString)
+                Log.e(TAG, "ANALYSIS_ERROR: HTTP $responseCode - $errorMsg")
+                return@withContext Result.failure(Exception(errorMsg))
             }
 
-            val rootJson = JSONObject(responseString)
+            if (responseString.isBlank()) {
+                Log.e(TAG, "ANALYSIS_ERROR: Empty response body")
+                return@withContext Result.failure(Exception("AI service returned an empty response. Please try again."))
+            }
+
+            // Stage 4: Creating drawing steps
+            onProgress("Creating drawing steps...")
+            Log.d(TAG, "JSON_PARSE_START: Extracting candidates and parsing payload")
+
+            val rootJson = try {
+                JSONObject(responseString)
+            } catch (e: JSONException) {
+                Log.e(TAG, "ANALYSIS_ERROR: Malformed root JSON", e)
+                return@withContext Result.failure(Exception("AI service returned an invalid response structure."))
+            }
+
             val candidates = rootJson.optJSONArray("candidates")
             if (candidates == null || candidates.length() == 0) {
-                return@withContext Result.failure(Exception("No tutorial generated from model."))
+                val blockReason = rootJson.optJSONObject("promptFeedback")?.optString("blockReason")
+                val msg = if (!blockReason.isNullOrBlank()) "Content blocked: $blockReason" else "No tutorial generated by AI model."
+                Log.e(TAG, "ANALYSIS_ERROR: $msg")
+                return@withContext Result.failure(Exception(msg))
             }
 
-            val content = candidates.getJSONObject(0).optJSONObject("content")
+            val candidateObj = candidates.getJSONObject(0)
+            val content = candidateObj.optJSONObject("content")
             val parts = content?.optJSONArray("parts")
-            val rawOutput = parts?.getJSONObject(0)?.optString("text") ?: ""
+            val rawOutput = parts?.optJSONObject(0)?.optString("text") ?: ""
 
-            // Strip code fences if present
-            val cleaned = cleanJsonString(rawOutput)
-            val parsedResult = parseTutorialJson(cleaned)
+            if (rawOutput.isBlank()) {
+                Log.e(TAG, "ANALYSIS_ERROR: Empty content text in candidate parts")
+                return@withContext Result.failure(Exception("The AI returned an empty drawing plan. Please try again."))
+            }
+
+            // Stage 5: Almost done
+            onProgress("Almost done...")
+            val cleanedJson = extractJsonSubstring(rawOutput)
+            val parsedResult = parseAndValidateTutorialJson(cleanedJson)
 
             if (parsedResult.steps.isEmpty()) {
-                return@withContext Result.failure(Exception("Could not extract drawing steps from AI response."))
+                Log.e(TAG, "ANALYSIS_ERROR: Zero valid drawing steps parsed")
+                return@withContext Result.failure(Exception("The AI returned an invalid drawing plan. Please try again."))
             }
 
+            Log.d(TAG, "JSON_PARSE_SUCCESS: Successfully parsed ${parsedResult.steps.size} steps")
+            Log.d(TAG, "DRAWING_STEPS_CREATED: Title = \"${parsedResult.title}\"")
+            Log.d(TAG, "ANALYSIS_COMPLETE")
+
             Result.success(parsedResult)
+        } catch (oom: OutOfMemoryError) {
+            Log.e(TAG, "ANALYSIS_ERROR: OutOfMemoryError during image analysis", oom)
+            System.gc()
+            Result.failure(Exception("Image is too large. Please choose another image."))
         } catch (e: Exception) {
-            Result.failure(e)
+            Log.e(TAG, "ANALYSIS_ERROR: Unexpected error ${e.javaClass.simpleName}: ${e.message}", e)
+            Result.failure(Exception("Analysis failed: ${e.message ?: "Unknown error"}. Please try again."))
         }
     }
 
-    data class AnalysisResult(
-        val title: String,
-        val detectedSubject: String,
-        val steps: List<DrawingStep>
-    )
+    private fun extractErrorMessage(code: Int, responseString: String): String {
+        return try {
+            val errJson = JSONObject(responseString)
+            val errorObj = errJson.optJSONObject("error")
+            val message = errorObj?.optString("message") ?: ""
+            val status = errorObj?.optString("status") ?: ""
 
-    private fun cleanJsonString(raw: String): String {
-        var str = raw.trim()
-        if (str.startsWith("```json")) {
-            str = str.removePrefix("```json")
-        } else if (str.startsWith("```")) {
-            str = str.removePrefix("```")
+            when {
+                code == 400 && (message.contains("API key", ignoreCase = true) || status == "INVALID_ARGUMENT") ->
+                    "API key is invalid. Please check your API key in Settings."
+                code == 403 || message.contains("API_KEY_INVALID", ignoreCase = true) ->
+                    "Invalid API key. Please check your API key in Settings."
+                code == 429 || status == "RESOURCE_EXHAUSTED" ->
+                    "AI quota limit reached. Please wait a moment and try again."
+                message.isNotBlank() ->
+                    "AI Error: $message"
+                else ->
+                    "HTTP Error $code: Please check connection and try again."
+            }
+        } catch (e: Exception) {
+            if (code == 403) "Invalid API key. Please check your API key in Settings."
+            else "Server communication failed (HTTP $code)."
         }
-        if (str.endsWith("```")) {
-            str = str.removeSuffix("```")
-        }
-        return str.trim()
     }
 
-    private fun parseTutorialJson(jsonString: String): AnalysisResult {
+    private fun extractJsonSubstring(raw: String): String {
+        val trimmed = raw.trim()
+        val firstBrace = trimmed.indexOf('{')
+        val lastBrace = trimmed.lastIndexOf('}')
+        return if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+            trimmed.substring(firstBrace, lastBrace + 1)
+        } else {
+            trimmed
+        }
+    }
+
+    private fun parseAndValidateTutorialJson(jsonString: String): AnalysisResult {
         val root = JSONObject(jsonString)
-        val title = root.optString("title", "AI Progressive Sketch")
+        val title = root.optString("title", "Portrait Sketch").ifBlank { "LineSketch Tutorial" }
         val detectedSubject = root.optString("detectedSubject", "Subject")
         val stepsJson = root.optJSONArray("steps") ?: JSONArray()
 
         val steps = mutableListOf<DrawingStep>()
         for (i in 0 until stepsJson.length()) {
-            val sObj = stepsJson.getJSONObject(i)
+            val sObj = stepsJson.optJSONObject(i) ?: continue
             val stepNumber = sObj.optInt("step", i + 1)
-            val stepTitle = sObj.optString("title", "Step $stepNumber")
-            val instruction = sObj.optString("instruction", "Draw the indicated line.")
+            val stepTitle = sObj.optString("title", "Step $stepNumber").ifBlank { "Step $stepNumber" }
+            val instruction = sObj.optString("instruction", "Follow the construction line carefully.")
             val type = sObj.optString("type", "curve")
             val difficulty = sObj.optString("difficulty", "easy")
             val estimatedTime = sObj.optString("estimatedTime", "30s")
@@ -176,11 +252,26 @@ object AIAnalyzer {
             val pointsJson = sObj.optJSONArray("points")
             if (pointsJson != null) {
                 for (j in 0 until pointsJson.length()) {
-                    val pObj = pointsJson.getJSONObject(j)
-                    val x = pObj.optDouble("x", 0.5).toFloat().coerceIn(0.0f, 1.0f)
-                    val y = pObj.optDouble("y", 0.5).toFloat().coerceIn(0.0f, 1.0f)
-                    pointsList.add(NormalizedPoint(x, y))
+                    val pObj = pointsJson.optJSONObject(j) ?: continue
+                    val rawX = pObj.optDouble("x", Double.NaN)
+                    val rawY = pObj.optDouble("y", Double.NaN)
+
+                    // Safely validate and clamp coordinates
+                    if (!rawX.isNaN() && !rawX.isInfinite() && !rawY.isNaN() && !rawY.isInfinite()) {
+                        val clampedX = rawX.toFloat().coerceIn(0.0f, 1.0f)
+                        val clampedY = rawY.toFloat().coerceIn(0.0f, 1.0f)
+                        pointsList.add(NormalizedPoint(clampedX, clampedY))
+                    }
                 }
+            }
+
+            // Ensure step has at least 2 points to render a meaningful line
+            if (pointsList.isEmpty()) {
+                pointsList.add(NormalizedPoint(0.40f, 0.40f))
+                pointsList.add(NormalizedPoint(0.60f, 0.60f))
+            } else if (pointsList.size == 1) {
+                val p = pointsList.first()
+                pointsList.add(NormalizedPoint((p.x + 0.05f).coerceIn(0.0f, 1.0f), (p.y + 0.05f).coerceIn(0.0f, 1.0f)))
             }
 
             steps.add(
