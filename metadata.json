@@ -1,0 +1,6 @@
+{
+  "name": "LineSketch AI",
+  "description": "Progressive line-by-line drawing tutor that breaks any reference image into step-by-step vector guides with live stroke validation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
